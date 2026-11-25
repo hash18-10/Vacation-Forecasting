@@ -5,7 +5,9 @@ Every number shown comes from the existing employee-level pipeline in src/vacati
 
 from __future__ import annotations
 
+import hashlib
 import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from vacation_forecasting.config import get_settings  # noqa: E402
+from vacation_forecasting.data_loader import discover_timesheet_files  # noqa: E402
 from vacation_forecasting.demo import DemoResult, build_demo  # noqa: E402
 from vacation_forecasting.employee_forecasting import with_model_labels  # noqa: E402
 from vacation_forecasting.employee_report import load_clean_all  # noqa: E402
@@ -30,21 +33,31 @@ HORIZON_OPTIONS = (3, 6, 12)
 SERIES_DOMAIN = ["Historical", "Forecast"]
 
 
+def _save_uploads(uploads: list) -> Path:
+    """Write uploaded timesheets to a temporary folder keyed by their names and sizes."""
+    signature = repr(sorted((item.name, item.size) for item in uploads)).encode()
+    folder = Path(tempfile.gettempdir()) / "vf_uploads" / hashlib.sha256(signature).hexdigest()[:16]
+    folder.mkdir(parents=True, exist_ok=True)
+    for item in uploads:
+        (folder / item.name).write_bytes(item.getbuffer())
+    return folder
+
+
 @st.cache_resource(show_spinner="Loading timesheets. The first load can take a few minutes...")
-def _all_rows() -> pd.DataFrame:
+def _all_rows(raw_dir: Path) -> pd.DataFrame:
     """Clean, vacation-flagged rows for every PAG. Held once in memory, not copied per PAG."""
-    return load_clean_all(get_settings())
+    return load_clean_all(replace(get_settings(), raw_dir=raw_dir))
 
 
 @st.cache_data(show_spinner=False)
-def _pag_names() -> list[str]:
-    return available_pags(_all_rows())
+def _pag_names(raw_dir: Path) -> list[str]:
+    return available_pags(_all_rows(raw_dir))
 
 
 @st.cache_data(show_spinner="Running the employee-level forecast...")
-def _demo(pag: str, horizon: int) -> DemoResult:
-    settings = replace(get_settings(), pag=pag, forecast_horizon=horizon)
-    pag_df = select_pag(_all_rows(), pag)
+def _demo(pag: str, horizon: int, raw_dir: Path) -> DemoResult:
+    settings = replace(get_settings(), pag=pag, forecast_horizon=horizon, raw_dir=raw_dir)
+    pag_df = select_pag(_all_rows(raw_dir), pag)
     holidays = load_holidays(settings.holidays_csv)
     return build_demo(pag_df, holidays, settings)
 
@@ -107,7 +120,21 @@ def _monthly_view(monthly: pd.DataFrame, days_label: str = "Vacation Days") -> p
 st.set_page_config(page_title="AI-Powered Vacation Forecasting", layout="wide")
 st.title("AI-Powered Vacation Forecasting")
 
-pags = _pag_names()
+uploads = st.file_uploader(
+    "Timesheet files (.xlsb or .csv)", type=["xlsb", "csv"], accept_multiple_files=True
+)
+settings_default = get_settings()
+if uploads:
+    raw_dir = _save_uploads(uploads)
+else:
+    try:
+        discover_timesheet_files(settings_default.raw_dir, exclude=settings_default.holidays_csv)
+        raw_dir = settings_default.raw_dir
+    except FileNotFoundError:
+        st.info("Upload the timesheet files above to run the forecast.")
+        st.stop()
+
+pags = _pag_names(raw_dir)
 if not pags:
     st.error("No PAGs found in the timesheet data.")
     st.stop()
@@ -120,7 +147,7 @@ horizon = right.selectbox(
 st.caption(f"Vacation type: {VACATION_TYPE}. Working days are Monday to Friday.")
 
 try:
-    demo = _demo(pag, int(horizon))
+    demo = _demo(pag, int(horizon), raw_dir)
 except (FileNotFoundError, ValueError, ImportError) as exc:
     st.error(str(exc))
     st.stop()

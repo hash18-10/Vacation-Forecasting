@@ -1,0 +1,6 @@
+pandas>=2.2,<4
+numpy>=1.26
+pyxlsb>=1.0.10
+xgboost>=2.0
+streamlit>=1.36
+pytest>=8.0

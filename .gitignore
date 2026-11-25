@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Local environment and secrets
+.env
+
+# Data and generated artifacts (keep folder structure via .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/holidays.csv
+data/processed/*
+!data/processed/.gitkeep
+models/*
+!models/.gitkeep
+reports/output/*
+!reports/output/.gitkeep
+
+# Excel lock files
+~$*

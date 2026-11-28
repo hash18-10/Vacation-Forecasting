@@ -155,7 +155,8 @@ def load_timesheet_file(path: Path, settings: Settings) -> tuple[pd.DataFrame, d
         sheet = 0
         raw = pd.read_csv(path, header=header_row)
     frame = raw.rename(columns={raw_name: canonical for canonical, raw_name in mapping.items()})
-    frame[SOURCE_FILE_COLUMN] = path.name
+    if SOURCE_FILE_COLUMN not in frame.columns:
+        frame[SOURCE_FILE_COLUMN] = path.name
     frame[SOURCE_SHEET_COLUMN] = str(sheet)
     frame[SOURCE_ROW_COLUMN] = range(header_row + 2, header_row + 2 + len(frame))
     unmapped = [column for column in raw.columns if str(column) not in mapping.values()]

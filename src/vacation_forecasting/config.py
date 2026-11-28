@@ -88,7 +88,7 @@ class Settings:
     """Runtime settings for the pipeline. Paths are resolved relative to the project root."""
 
     pag: str = "Solvay"
-    raw_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data" / "raw")
+    raw_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data" / "processed" / "mfg_la")
     processed_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data" / "processed")
     models_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "models")
     output_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "reports" / "output")

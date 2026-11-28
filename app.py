@@ -30,11 +30,11 @@ from vacation_forecasting.normalization import financial_year_end, financial_yea
 from vacation_forecasting.preprocessing import preprocess_timesheets  # noqa: E402
 from vacation_forecasting.vacation_analysis import (
     add_vacation_flag,
+    available_pags,
     employee_leave_lookup,
     select_pag,
 )  # noqa: E402
 
-FORECAST_PAG = "MFG LA"
 FORECAST_HORIZON = 12
 VACATION_TYPE = "Vacation (TRC 105)"
 # Validated in reports/model_validation.md on 6- and 12-month holdouts. Seasonal naive uses only actual history.
@@ -47,7 +47,7 @@ def _load_timesheets(raw_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     settings = replace(get_settings(), raw_dir=raw_dir)
     raw = load_raw_timesheets(settings)
     result = preprocess_timesheets(raw, settings)
-    clean = add_vacation_flag(result.clean, settings.vacation_trc_codes).assign(pag=FORECAST_PAG)
+    clean = add_vacation_flag(result.clean, settings.vacation_trc_codes)
 
     loaded_counts = raw.groupby(SOURCE_FILE_COLUMN).size().rename("Rows loaded")
     clean_counts = result.clean.groupby(SOURCE_FILE_COLUMN).size().rename("Rows accepted")
@@ -57,10 +57,14 @@ def _load_timesheets(raw_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 @st.cache_data(show_spinner="Running the employee-level forecast...")
-def _demo(pag: str, horizon: int, raw_dir: Path) -> DemoResult:
+def _demo(pag: str, manager: str | None, director: str | None, horizon: int, raw_dir: Path) -> DemoResult:
     settings = replace(get_settings(), pag=pag, forecast_horizon=horizon, raw_dir=raw_dir)
     all_rows, _ = _load_timesheets(raw_dir)
     pag_df = select_pag(all_rows, pag)
+    if manager is not None:
+        pag_df = pag_df.loc[pag_df["manager"].astype(str).str.strip().eq(manager)]
+    if director is not None:
+        pag_df = pag_df.loc[pag_df["director"].astype(str).str.strip().eq(director)]
     holidays = load_holidays(settings.holidays_csv)
     return build_demo(pag_df, holidays, settings)
 
@@ -146,15 +150,8 @@ with st.status("Validating timesheet files...", expanded=False) as validation_st
              f"{validation['Rows rejected'].sum():,} rejected.")
     st.dataframe(validation, hide_index=True)
 
-if FORECAST_PAG not in set(all_rows["pag"].dropna()):
-    available = ", ".join(sorted(all_rows["pag"].dropna().unique()))
-    st.error(f"PAG '{FORECAST_PAG}' is not present in the uploaded data. Available PAGs: {available}")
-    st.stop()
-
-pag_rows = select_pag(all_rows, FORECAST_PAG)
-
 st.subheader("Employee Leave Lookup")
-employee_directory = pag_rows[["member_id", "member_name"]].dropna(subset=["member_id"]).copy()
+employee_directory = all_rows[["member_id", "member_name"]].dropna(subset=["member_id"]).copy()
 employee_directory["member_name"] = employee_directory["member_name"].fillna("").astype(str).str.strip()
 employee_directory = employee_directory.drop_duplicates("member_id")
 employee_directory["display_name"] = employee_directory["member_name"].where(
@@ -163,14 +160,14 @@ employee_directory["display_name"] = employee_directory["member_name"].where(
 employee_directory = employee_directory.sort_values("display_name")
 
 if employee_directory.empty:
-    st.info(f"No employees are available under {FORECAST_PAG}.")
+    st.info("No employees are available in the data.")
 else:
     employee_options = employee_directory.set_index("display_name")["member_id"].to_dict()
     selected_employee = st.selectbox("Employee name", list(employee_options))
     check_date = pd.Timestamp.today().date()
     selected_member_id = str(employee_options[selected_employee])
     last_year_date = pd.Timestamp(check_date) - pd.DateOffset(years=1)
-    day_rows, leave_history = employee_leave_lookup(pag_rows, selected_member_id, check_date)
+    day_rows, leave_history = employee_leave_lookup(all_rows, selected_member_id, check_date)
     leave_on_day = day_rows.loc[day_rows["trc_code"].isin(LEAVE_TRC_CODES)]
 
     st.caption(
@@ -209,8 +206,23 @@ else:
         yearly_by_type["Total leave hours"] = yearly_by_type.sum(axis=1)
         yearly_by_type["Leave entries"] = history_view.groupby("Year").size()
         st.dataframe(yearly_by_type.sort_index(ascending=False).reset_index(), hide_index=True)
+        year_labels = sorted(history_view["Year"].unique(), reverse=True)
+        month_numbers = {
+            pd.Timestamp(2000, m, 1).strftime("%B"): m
+            for m in sorted(history_view["transaction_date"].dt.month.unique())
+        }
+        filter_year, filter_month = st.columns(2)
+        selected_year = filter_year.selectbox("Leave year", ["All years", *year_labels])
+        selected_month = filter_month.selectbox("Leave month", ["All months", *month_numbers])
+        detail_view = history_view
+        if selected_year != "All years":
+            detail_view = detail_view.loc[detail_view["Year"].eq(selected_year)]
+        if selected_month != "All months":
+            detail_view = detail_view.loc[detail_view["transaction_date"].dt.month.eq(month_numbers[selected_month])]
+        if detail_view.empty:
+            st.info("No leave entries match the selected year and month.")
         st.dataframe(
-            history_view[["Date", "trc_description", "hours", SOURCE_FILE_COLUMN]].rename(
+            detail_view[["Date", "trc_description", "hours", SOURCE_FILE_COLUMN]].rename(
                 columns={
                     "trc_description": "Description",
                     "hours": "Hours",
@@ -259,8 +271,21 @@ else:
 
 st.caption(f"Vacation type: {VACATION_TYPE}. Working days are Monday to Friday.")
 
+pags = available_pags(all_rows)
+largest_pag = all_rows.groupby("pag")["member_id"].nunique().idxmax()
+filter_pag, filter_manager, filter_director = st.columns(3)
+selected_pag = filter_pag.selectbox("PAG", pags, index=pags.index(largest_pag))
+pag_people = select_pag(all_rows, selected_pag)
+managers = sorted(pag_people["manager"].dropna().astype(str).str.strip().loc[lambda s: s.ne("")].unique())
+directors = sorted(pag_people["director"].dropna().astype(str).str.strip().loc[lambda s: s.ne("")].unique())
+selected_manager = filter_manager.selectbox("Manager", ["All managers", *managers])
+selected_director = filter_director.selectbox("Director", ["All directors", *directors])
+manager_filter = None if selected_manager == "All managers" else selected_manager
+director_filter = None if selected_director == "All directors" else selected_director
+scope = " / ".join([selected_pag, selected_manager, selected_director])
+
 try:
-    demo = _demo(FORECAST_PAG, FORECAST_HORIZON, raw_dir)
+    demo = _demo(selected_pag, manager_filter, director_filter, FORECAST_HORIZON, raw_dir)
 except (FileNotFoundError, ValueError, ImportError) as exc:
     st.error(str(exc))
     st.stop()
@@ -303,7 +328,7 @@ st.caption(
     "Working days are Monday to Friday, summed over the forecast months."
 )
 
-st.subheader("PAG Monthly Forecast")
+st.subheader(f"PAG Monthly Forecast: {scope}")
 st.dataframe(_monthly_view(fm, days_label="Forecast Vacation Days"), hide_index=True)
 st.caption("Solid line: historical vacation %. Dashed line: forecast vacation %.")
 st.altair_chart(_vacation_chart(bv.history_monthly, fm))

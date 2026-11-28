@@ -33,6 +33,8 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "hours": ("Hours", "Hrs", "Hours Worked", "Hours(Daily)"),
     "location": ("Location", "Work Location", "Office Location"),
     "department_description": ("DEPT DESC", "Dept Desc", "Department Desc"),
+    "manager": ("MANAGER", "Manager Name", "Member Supervisor"),
+    "director": ("DIRECTOR", "Director Name"),
 }
 REQUIRED_COLUMNS: tuple[str, ...] = ("member_id", "transaction_date", "pag", "trc_code", "hours")
 

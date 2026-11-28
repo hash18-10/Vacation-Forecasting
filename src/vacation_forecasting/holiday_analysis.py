@@ -15,7 +15,7 @@ from vacation_forecasting.config import INDIA_LOCATION
 logger = logging.getLogger(__name__)
 
 HOLIDAY_COLUMNS = ("date", "holiday_name", "holiday_type", "location", "source_file", "year")
-HOLIDAY_TYPES = ("Mandatory", "Restricted/Optional")
+HOLIDAY_TYPES = ("Mandatory", "Restricted/Optional", "Sick Leave", "Contingency Leave", "Vacation")
 DEDUP_COLUMNS = ["date", "holiday_name", "holiday_type", "location"]
 
 

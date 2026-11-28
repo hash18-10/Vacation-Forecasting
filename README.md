@@ -4,7 +4,7 @@ A standalone Python proof of concept that forecasts monthly vacation hours for o
 
 ## Scope
 
-- Input: `.xlsb` timesheets (via `pyxlsb`). `.csv` files with the same columns are also accepted for offline use.
+- Input: `.xlsb` timesheets (via the faster Calamine engine, with `pyxlsb` fallback). `.csv` files with the same columns are also accepted for offline use.
 - Vacation is defined by TRC code only (default `105`). Descriptions are never used.
 - Financial year runs October to September (FY2024 = Oct 2023 to Sep 2024).
 - PAG spelling variants are normalized (for example `Solvay SA` to `Solvay`).
@@ -20,6 +20,7 @@ python -m pip install -r requirements.txt
 
 ## Data
 
+- Any `.xlsb` or `.csv` filename is accepted. Workbook sheet and header row are detected from the required timesheet columns (header rows 1-21 are scanned).
 - Place timesheet files in `data/raw/`. Lock files (`~$*`) are ignored.
 - `data/raw/holidays.csv` holds the holiday calendar with columns `date,holiday_name,location`. Use `ALL` for location to apply to every site. This file is excluded from timesheet discovery.
 - Override the folder with `VF_RAW_DIR` or `--raw-dir`.

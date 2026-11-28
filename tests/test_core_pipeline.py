@@ -29,11 +29,33 @@ from vacation_forecasting.preprocessing import preprocess_timesheets
 from vacation_forecasting.vacation_analysis import (
     add_vacation_flag,
     calendar_month_profile,
+    employee_leave_lookup,
     fy_vacation_summary,
     monthly_vacation_summary,
 )
 
 FAST_MODEL = ModelSettings(n_estimators=40, max_depth=2)
+
+
+def test_employee_leave_lookup_checks_last_year_and_four_year_history() -> None:
+    rows = pd.DataFrame(
+        {
+            "member_id": ["E1", "E1", "E1", "E1", "E2", "E1"],
+            "transaction_date": pd.to_datetime(
+                ["2024-02-28", "2022-03-01", "2020-02-28", "2026-03-01", "2024-02-28", "2024-02-27"]
+            ),
+            "hours": [4.5, 9.0, 9.0, 9.0, 9.0, 2.0],
+            "trc_code": ["105", "115", "109", "610", "105", "10100"],
+        }
+    )
+
+    day_rows, four_year_history = employee_leave_lookup(rows, "E1", pd.Timestamp("2025-02-28"))
+
+    assert day_rows["transaction_date"].tolist() == [pd.Timestamp("2024-02-28")]
+    assert four_year_history["transaction_date"].tolist() == [
+        pd.Timestamp("2024-02-28"),
+        pd.Timestamp("2022-03-01"),
+    ]
 
 
 def canonicalize(raw: pd.DataFrame) -> pd.DataFrame:

@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
-from vacation_forecasting.config import PAG_ALIASES, UNKNOWN_LOCATION, Settings
+from vacation_forecasting.config import FISCAL_YEAR_SOURCE_FILES, PAG_ALIASES, UNKNOWN_LOCATION, Settings
+from vacation_forecasting.data_loader import SOURCE_FILE_COLUMN
 from vacation_forecasting.normalization import (
     clean_text,
     derive_location_series,
@@ -54,18 +56,23 @@ def preprocess_timesheets(raw: pd.DataFrame, settings: Settings) -> PreprocessRe
     df.loc[derived_location.notna(), "location_source"] = "department description"
     df.loc[source_location.notna(), "location_source"] = "location column"
 
-    checks = pd.DataFrame(
-        {
-            "missing_date": df["transaction_date"].isna(),
-            "missing_member_id": df["member_id"].isna(),
-            "missing_pag": df["pag"].isna(),
-            "missing_trc_code": df["trc_code"].isna(),
-            "invalid_hours": df["hours"].isna(),
-        },
-        index=df.index,
+    checks = {
+        "missing_date": df["transaction_date"].isna(),
+        "missing_member_id": df["member_id"].isna(),
+        "missing_pag": df["pag"].isna(),
+        "missing_trc_code": df["trc_code"].isna(),
+        "invalid_hours": df["hours"].isna(),
+    }
+    check_names = list(checks)
+    flags = np.column_stack([check.to_numpy(dtype=np.uint8) for check in checks.values()])
+    reason_codes = flags @ (1 << np.arange(len(check_names), dtype=np.uint8))
+    reason_lookup = np.array(
+        [";".join(name for bit, name in enumerate(check_names) if code & (1 << bit))
+         for code in range(1 << len(check_names))],
+        dtype=object,
     )
-    reasons = checks.apply(lambda row: ";".join(name for name, bad in row.items() if bad), axis=1)
-    is_rejected = reasons.ne("")
+    reasons = pd.Series(reason_lookup[reason_codes], index=df.index)
+    is_rejected = reason_codes != 0
 
     rejected = df.loc[is_rejected].assign(rejection_reason=reasons[is_rejected])
     clean = df.loc[~is_rejected].copy()
@@ -74,9 +81,25 @@ def preprocess_timesheets(raw: pd.DataFrame, settings: Settings) -> PreprocessRe
     clean["financial_year"] = fy_end
     clean["financial_year_label"] = fy_end.map(financial_year_label)
     clean["fy_month_index"] = fy_month_index(clean["transaction_date"], settings.fy_start_month)
+    clean = _apply_fiscal_year_sources(clean)
 
     _log_preprocess_summary(clean, rejected, settings)
     return PreprocessResult(clean=clean, rejected=rejected)
+
+
+def _apply_fiscal_year_sources(clean: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows of a fiscal year that come from a file other than that year's source file."""
+    if SOURCE_FILE_COLUMN not in clean.columns:
+        return clean
+    keep = pd.Series(True, index=clean.index)
+    for fy_end, source_file in FISCAL_YEAR_SOURCE_FILES.items():
+        if not clean[SOURCE_FILE_COLUMN].eq(source_file).any():
+            continue
+        other_file_rows = clean["financial_year"].eq(fy_end) & clean[SOURCE_FILE_COLUMN].ne(source_file)
+        keep &= ~other_file_rows
+    if (~keep).any():
+        logger.info("Dropped %d row(s) outside their fiscal year source file", int((~keep).sum()))
+    return clean.loc[keep]
 
 
 def _log_preprocess_summary(clean: pd.DataFrame, rejected: pd.DataFrame, settings: Settings) -> None:

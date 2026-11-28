@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import date
 
 import pandas as pd
 
-from vacation_forecasting.config import VACATION_TRC_CODES
+from vacation_forecasting.config import LEAVE_TRC_CODES, VACATION_TRC_CODES
 
 
 def classify_vacation(df: pd.DataFrame, trc_codes: Iterable[str] = VACATION_TRC_CODES) -> pd.Series:
@@ -33,6 +34,24 @@ def select_pag(df: pd.DataFrame, pag: str) -> pd.DataFrame:
     if subset.empty:
         raise ValueError(f"PAG '{pag}' not found. Available: {available_pags(df)}")
     return subset
+
+
+def employee_leave_lookup(
+    df: pd.DataFrame, member_id: str, as_of_date: date | pd.Timestamp, years: int = 4
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return the employee's rows on the same date last year and vacation rows in the prior N years."""
+    target_date = pd.Timestamp(as_of_date).normalize()
+    last_year_date = target_date - pd.DateOffset(years=1)
+    history_start = target_date - pd.DateOffset(years=years)
+    employee_rows = df.loc[df["member_id"].astype(str) == str(member_id)]
+    row_dates = employee_rows["transaction_date"].dt.normalize()
+    last_year_rows = employee_rows.loc[row_dates.eq(last_year_date)].copy()
+    vacation_history = employee_rows.loc[
+        employee_rows["trc_code"].isin(LEAVE_TRC_CODES)
+        & employee_rows["transaction_date"].ge(history_start)
+        & employee_rows["transaction_date"].le(target_date)
+    ].copy()
+    return last_year_rows, vacation_history
 
 
 def headline_metrics(df: pd.DataFrame) -> dict[str, float | int | str | None]:

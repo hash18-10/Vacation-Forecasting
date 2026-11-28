@@ -5,9 +5,7 @@ Every number shown comes from the existing employee-level pipeline in src/vacati
 
 from __future__ import annotations
 
-import hashlib
 import sys
-import tempfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,46 +16,51 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from vacation_forecasting.config import get_settings  # noqa: E402
-from vacation_forecasting.data_loader import discover_timesheet_files  # noqa: E402
+from vacation_forecasting.config import LEAVE_TRC_CODES, get_settings  # noqa: E402
+from vacation_forecasting.data_loader import SOURCE_FILE_COLUMN, discover_timesheet_files, load_raw_timesheets  # noqa: E402
 from vacation_forecasting.demo import DemoResult, build_demo  # noqa: E402
+from vacation_forecasting.employee_leave_forecast import (  # noqa: E402
+    build_employee_monthly_forecast,
+    build_leave_forecast,
+    ranked_months,
+)
 from vacation_forecasting.employee_forecasting import with_model_labels  # noqa: E402
-from vacation_forecasting.employee_report import load_clean_all  # noqa: E402
 from vacation_forecasting.holiday_analysis import load_holidays  # noqa: E402
-from vacation_forecasting.vacation_analysis import available_pags, select_pag  # noqa: E402
+from vacation_forecasting.normalization import financial_year_end, financial_year_label  # noqa: E402
+from vacation_forecasting.preprocessing import preprocess_timesheets  # noqa: E402
+from vacation_forecasting.vacation_analysis import (
+    add_vacation_flag,
+    employee_leave_lookup,
+    select_pag,
+)  # noqa: E402
 
-DEFAULT_PAG = "Solvay"
+FORECAST_PAG = "MFG LA"
+FORECAST_HORIZON = 12
 VACATION_TYPE = "Vacation (TRC 105)"
 # Validated in reports/model_validation.md on 6- and 12-month holdouts. Seasonal naive uses only actual history.
-HORIZON_OPTIONS = (3, 6, 12)
 SERIES_DOMAIN = ["Historical", "Forecast"]
 
 
-def _save_uploads(uploads: list) -> Path:
-    """Write uploaded timesheets to a temporary folder keyed by their names and sizes."""
-    signature = repr(sorted((item.name, item.size) for item in uploads)).encode()
-    folder = Path(tempfile.gettempdir()) / "vf_uploads" / hashlib.sha256(signature).hexdigest()[:16]
-    folder.mkdir(parents=True, exist_ok=True)
-    for item in uploads:
-        (folder / item.name).write_bytes(item.getbuffer())
-    return folder
+@st.cache_resource(show_spinner=False)
+def _load_timesheets(raw_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load and validate timesheets once, returning clean rows and per-file validation counts."""
+    settings = replace(get_settings(), raw_dir=raw_dir)
+    raw = load_raw_timesheets(settings)
+    result = preprocess_timesheets(raw, settings)
+    clean = add_vacation_flag(result.clean, settings.vacation_trc_codes).assign(pag=FORECAST_PAG)
 
-
-@st.cache_resource(show_spinner="Loading timesheets. The first load can take a few minutes...")
-def _all_rows(raw_dir: Path) -> pd.DataFrame:
-    """Clean, vacation-flagged rows for every PAG. Held once in memory, not copied per PAG."""
-    return load_clean_all(replace(get_settings(), raw_dir=raw_dir))
-
-
-@st.cache_data(show_spinner=False)
-def _pag_names(raw_dir: Path) -> list[str]:
-    return available_pags(_all_rows(raw_dir))
+    loaded_counts = raw.groupby(SOURCE_FILE_COLUMN).size().rename("Rows loaded")
+    clean_counts = result.clean.groupby(SOURCE_FILE_COLUMN).size().rename("Rows accepted")
+    rejected_counts = result.rejected.groupby(SOURCE_FILE_COLUMN).size().rename("Rows rejected")
+    validation = pd.concat([loaded_counts, clean_counts, rejected_counts], axis=1).fillna(0).astype(int)
+    return clean, validation.reset_index()
 
 
 @st.cache_data(show_spinner="Running the employee-level forecast...")
 def _demo(pag: str, horizon: int, raw_dir: Path) -> DemoResult:
     settings = replace(get_settings(), pag=pag, forecast_horizon=horizon, raw_dir=raw_dir)
-    pag_df = select_pag(_all_rows(raw_dir), pag)
+    all_rows, _ = _load_timesheets(raw_dir)
+    pag_df = select_pag(all_rows, pag)
     holidays = load_holidays(settings.holidays_csv)
     return build_demo(pag_df, holidays, settings)
 
@@ -120,34 +123,144 @@ def _monthly_view(monthly: pd.DataFrame, days_label: str = "Vacation Days") -> p
 st.set_page_config(page_title="AI-Powered Vacation Forecasting", layout="wide")
 st.title("AI-Powered Vacation Forecasting")
 
-uploads = st.file_uploader(
-    "Timesheet files (.xlsb or .csv)", type=["xlsb", "csv"], accept_multiple_files=True
-)
 settings_default = get_settings()
-if uploads:
-    raw_dir = _save_uploads(uploads)
-else:
-    try:
-        discover_timesheet_files(settings_default.raw_dir, exclude=settings_default.holidays_csv)
-        raw_dir = settings_default.raw_dir
-    except FileNotFoundError:
-        st.info("Upload the timesheet files above to run the forecast.")
-        st.stop()
-
-pags = _pag_names(raw_dir)
-if not pags:
-    st.error("No PAGs found in the timesheet data.")
+raw_dir = settings_default.raw_dir
+try:
+    discover_timesheet_files(raw_dir, exclude=settings_default.holidays_csv)
+except FileNotFoundError as exc:
+    st.error(str(exc))
     st.stop()
 
-left, right = st.columns(2)
-pag = left.selectbox("PAG", pags, index=pags.index(DEFAULT_PAG) if DEFAULT_PAG in pags else 0)
-horizon = right.selectbox(
-    "Forecast period", HORIZON_OPTIONS, index=HORIZON_OPTIONS.index(6), format_func=lambda n: f"Next {n} months"
-)
+with st.status("Validating timesheet files...", expanded=False) as validation_status:
+    st.write("Reading workbooks and checking required columns and row values. Large files may take a few minutes.")
+    try:
+        all_rows, validation = _load_timesheets(raw_dir)
+    except Exception as exc:
+        validation_status.update(label="Timesheet validation failed", state="error")
+        st.error(f"{type(exc).__name__}: {exc}")
+        st.stop()
+
+    validation_status.update(label="Timesheet validation complete", state="complete")
+    st.write(f"Validated {len(validation)} file(s): {validation['Rows loaded'].sum():,} rows loaded, "
+             f"{validation['Rows accepted'].sum():,} accepted, "
+             f"{validation['Rows rejected'].sum():,} rejected.")
+    st.dataframe(validation, hide_index=True)
+
+if FORECAST_PAG not in set(all_rows["pag"].dropna()):
+    available = ", ".join(sorted(all_rows["pag"].dropna().unique()))
+    st.error(f"PAG '{FORECAST_PAG}' is not present in the uploaded data. Available PAGs: {available}")
+    st.stop()
+
+pag_rows = select_pag(all_rows, FORECAST_PAG)
+
+st.subheader("Employee Leave Lookup")
+employee_directory = pag_rows[["member_id", "member_name"]].dropna(subset=["member_id"]).copy()
+employee_directory["member_name"] = employee_directory["member_name"].fillna("").astype(str).str.strip()
+employee_directory = employee_directory.drop_duplicates("member_id")
+employee_directory["display_name"] = employee_directory["member_name"].where(
+    employee_directory["member_name"].ne(""), "Employee"
+) + " (" + employee_directory["member_id"].astype(str) + ")"
+employee_directory = employee_directory.sort_values("display_name")
+
+if employee_directory.empty:
+    st.info(f"No employees are available under {FORECAST_PAG}.")
+else:
+    employee_options = employee_directory.set_index("display_name")["member_id"].to_dict()
+    selected_employee = st.selectbox("Employee name", list(employee_options))
+    check_date = pd.Timestamp.today().date()
+    selected_member_id = str(employee_options[selected_employee])
+    last_year_date = pd.Timestamp(check_date) - pd.DateOffset(years=1)
+    day_rows, leave_history = employee_leave_lookup(pag_rows, selected_member_id, check_date)
+    leave_on_day = day_rows.loc[day_rows["trc_code"].isin(LEAVE_TRC_CODES)]
+
+    st.caption(
+        f"Checking {last_year_date:%d %b %Y}. Four-year history window: "
+        f"{(pd.Timestamp(check_date) - pd.DateOffset(years=4)):%d %b %Y} to {pd.Timestamp(check_date):%d %b %Y}."
+    )
+    if not leave_on_day.empty:
+        st.success(f"Leave was recorded on {last_year_date:%d %b %Y}: {leave_on_day['hours'].sum():g} hours.")
+        st.dataframe(
+            leave_on_day[["transaction_date", "trc_code", "trc_description", "hours"]].rename(
+                columns={
+                    "transaction_date": "Date",
+                    "trc_code": "TRC",
+                    "trc_description": "Description",
+                    "hours": "Hours",
+                }
+            ),
+            hide_index=True,
+        )
+    elif day_rows.empty:
+        st.warning(f"No timesheet entry was found for {last_year_date:%d %b %Y}; leave cannot be confirmed.")
+    else:
+        st.info(f"Timesheet entries exist on {last_year_date:%d %b %Y}, but no leave was recorded.")
+
+    if leave_history.empty:
+        st.info("No leave records were found in this four-year window.")
+    else:
+        fy_end = financial_year_end(leave_history["transaction_date"])
+        history_view = leave_history.assign(
+            Year=fy_end.map(lambda y: f"{financial_year_label(y)} (Oct {int(y) - 1} - Sep {int(y)})"),
+            Date=leave_history["transaction_date"].dt.strftime("%d %b %Y"),
+        )
+        yearly_by_type = history_view.pivot_table(
+            index="Year", columns="trc_description", values="hours", aggfunc="sum", fill_value=0.0
+        )
+        yearly_by_type["Total leave hours"] = yearly_by_type.sum(axis=1)
+        yearly_by_type["Leave entries"] = history_view.groupby("Year").size()
+        st.dataframe(yearly_by_type.sort_index(ascending=False).reset_index(), hide_index=True)
+        st.dataframe(
+            history_view[["Date", "trc_description", "hours", SOURCE_FILE_COLUMN]].rename(
+                columns={
+                    "trc_description": "Description",
+                    "hours": "Hours",
+                    SOURCE_FILE_COLUMN: "Source file",
+                }
+            ),
+            hide_index=True,
+        )
+
+    st.markdown(f"#### Leave forecast: {selected_employee}")
+    leave_forecast = build_leave_forecast(
+        all_rows, selected_member_id, all_rows["month"].max(), pd.Timestamp.today().date()
+    )
+    ranked = ranked_months(leave_forecast.profile)
+    if ranked.empty:
+        st.info("No leave history for this employee, so no forecast can be made.")
+    else:
+        top = ranked.iloc[0]
+        st.success(
+            f"{top['Month']} usually has the most leave: {top['avg_leave_days']:.1f} days on average over "
+            f"{int(top['years_observed'])} year(s). Expect similar leave in {top['Month']}."
+        )
+        st.dataframe(
+            ranked.rename(
+                columns={
+                    "Month": "Calendar month",
+                    "avg_leave_days": "Average leave days",
+                    "years_observed": "Years of history",
+                }
+            ).round(1),
+            hide_index=True,
+        )
+        employee_monthly = build_employee_monthly_forecast(
+            all_rows,
+            selected_member_id,
+            all_rows["month"].max(),
+            pd.Timestamp.today().date(),
+            load_holidays(settings_default.holidays_csv),
+        )
+        st.markdown("##### Monthly Forecast")
+        st.dataframe(_monthly_view(employee_monthly, days_label="Forecast Vacation Days"), hide_index=True)
+        st.caption(
+            "Forecast = average vacation days for the same calendar month over this employee's complete months "
+            "in the data (1 day = 9 h). Vacation % = vacation days / working days (Monday to Friday)."
+        )
+
 st.caption(f"Vacation type: {VACATION_TYPE}. Working days are Monday to Friday.")
 
 try:
-    demo = _demo(pag, int(horizon), raw_dir)
+    demo = _demo(FORECAST_PAG, FORECAST_HORIZON, raw_dir)
 except (FileNotFoundError, ValueError, ImportError) as exc:
     st.error(str(exc))
     st.stop()
@@ -164,7 +277,6 @@ st.caption(
     f"Last complete month in the data: {demo.run.window[1]:%b %Y}."
 )
 
-st.subheader(f"PAG: {pag}")
 c1, c2, c3 = st.columns(3)
 c1.metric("Forecast Vacation %", _fmt(fs["vacation_pct"], "%"))
 c2.metric("Forecast Availability %", _fmt(fs["availability_pct"], "%"))
@@ -191,7 +303,7 @@ st.caption(
     "Working days are Monday to Friday, summed over the forecast months."
 )
 
-st.subheader("Monthly Forecast")
+st.subheader("PAG Monthly Forecast")
 st.dataframe(_monthly_view(fm, days_label="Forecast Vacation Days"), hide_index=True)
 st.caption("Solid line: historical vacation %. Dashed line: forecast vacation %.")
 st.altair_chart(_vacation_chart(bv.history_monthly, fm))

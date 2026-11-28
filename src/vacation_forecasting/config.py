@@ -14,6 +14,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Vacation is identified by TRC code only. Descriptions are never used for classification.
 VACATION_TRC_CODES: frozenset[str] = frozenset({"105"})
+# Leave types counted for an employee: Vacation, Contingency, Sick and Restricted/Mandatory Holiday.
+LEAVE_TRC_CODES: frozenset[str] = frozenset({"105", "109", "115", "610"})
 
 # One full vacation day = 9 h. Checked on the real data: 1,846 of 1,886 vacation rows are 9.0 h and 37 are 4.5 h (half days).
 FULL_DAY_HOURS: float = 9.0
@@ -42,6 +44,10 @@ PAG_ALIASES: dict[str, tuple[str, ...]] = {
 # Financial year starts in October, so FY2024 = Oct 2023 to Sep 2024.
 FY_START_MONTH = 10
 EXCEL_DATE_ORIGIN = "1899-12-30"
+# Fiscal year -> the only file its rows are taken from. The YTD file also holds late Sep 2025 rows of FY2025.
+FISCAL_YEAR_SOURCE_FILES: dict[int, str] = {
+    2025: "FY25 Cumilative IRR Timesheet_ Oct to Sept 1.xlsb",
+}
 UNKNOWN_LOCATION = "UNKNOWN"
 INDIA_LOCATION = "India"  # national holidays; apply to every member
 # Location code in DEPT DESC (e.g. "MIG GHO Solvay Strm5 HYD SEZ") -> location name used in the holiday CSV.

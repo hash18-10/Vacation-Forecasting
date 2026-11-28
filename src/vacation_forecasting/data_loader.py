@@ -19,6 +19,9 @@ SOURCE_FILE_COLUMN = "source_file"
 SOURCE_ROW_COLUMN = "source_row"
 SOURCE_SHEET_COLUMN = "source_sheet"
 RAW_CACHE_NAME = "raw_timesheets_cache.pkl"
+MAX_HEADER_ROW_SCAN = 20
+# Reference workbook with fiscal month dates; not a timesheet.
+FISCAL_CALENDAR_NAME = "Fiscal_Calendar.xlsb"
 
 
 def header_key(name: object) -> str:
@@ -36,6 +39,7 @@ def discover_timesheet_files(raw_dir: Path, exclude: Path | None = None) -> list
         for path in raw_dir.iterdir()
         if path.suffix.lower() in SUPPORTED_SUFFIXES
         and not path.name.startswith("~$")
+        and path.name != FISCAL_CALENDAR_NAME
         and path.resolve() != excluded
     )
     if not files:
@@ -61,14 +65,25 @@ def resolve_columns(columns: Iterable[object], source_label: str) -> dict[str, s
     return mapping
 
 
-def read_workbook(path: Path, sheet_name: str | int, header_row: int) -> pd.DataFrame:
-    """Read one .xlsb (via pyxlsb) or .csv file."""
-    if path.suffix.lower() == ".xlsb":
+def _xlsb_engine() -> str:
+    try:
+        import python_calamine  # noqa: F401
+        return "calamine"
+    except ImportError as exc:
         try:
-            import pyxlsb  # noqa: F401  (engine dependency, imported for a clear error message)
-        except ImportError as exc:
-            raise ImportError("pyxlsb is required to read .xlsb files: pip install pyxlsb") from exc
-        return pd.read_excel(path, engine="pyxlsb", sheet_name=sheet_name, header=header_row)
+            import pyxlsb  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "python-calamine or pyxlsb is required to read .xlsb files: "
+                "pip install python-calamine"
+            ) from exc
+        return "pyxlsb"
+
+
+def read_workbook(path: Path, sheet_name: str | int, header_row: int) -> pd.DataFrame:
+    """Read one .xlsb (prefer Calamine, fall back to pyxlsb) or .csv file."""
+    if path.suffix.lower() == ".xlsb":
+        return pd.read_excel(path, engine=_xlsb_engine(), sheet_name=sheet_name, header=header_row)
     return pd.read_csv(path, header=header_row)
 
 
@@ -77,15 +92,68 @@ def sheet_for(path: Path, settings: Settings) -> str | int:
     return settings.sheet_overrides.get(path.stem, settings.sheet_name)
 
 
+def _header_rows(preferred: int) -> list[int]:
+    return [preferred, *(row for row in range(MAX_HEADER_ROW_SCAN + 1) if row != preferred)]
+
+
+def _find_csv_header(path: Path, settings: Settings) -> tuple[int, dict[str, str]]:
+    last_headers: list[str] = []
+    for header_row in _header_rows(settings.header_overrides.get(path.stem, settings.header_row)):
+        headers = pd.read_csv(path, header=header_row, nrows=0).columns
+        try:
+            return header_row, resolve_columns(headers, path.name)
+        except ValueError:
+            last_headers = [str(column) for column in headers]
+    raise ValueError(
+        f"{path.name}: required timesheet columns not found in the first "
+        f"{MAX_HEADER_ROW_SCAN + 1} rows. Headers found near the end of the scan: {last_headers}"
+    )
+
+
+def _find_excel_layout(
+    workbook: pd.ExcelFile, path: Path, settings: Settings
+) -> tuple[str | int, int, dict[str, str]]:
+    preferred_sheet = sheet_for(path, settings)
+    sheets = workbook.sheet_names
+    ordered_sheets = [preferred_sheet, *(sheet for sheet in sheets if sheet != preferred_sheet)]
+    preferred_header = settings.header_overrides.get(path.stem, settings.header_row)
+    last_headers: list[str] = []
+
+    for sheet in ordered_sheets:
+        if sheet not in sheets:
+            continue
+        for header_row in _header_rows(preferred_header):
+            try:
+                headers = workbook.parse(sheet_name=sheet, header=header_row, nrows=0).columns
+            except ValueError:
+                continue  # sheet is shorter than this header row
+            try:
+                mapping = resolve_columns(headers, path.name)
+            except ValueError:
+                last_headers = [str(column) for column in headers]
+                continue
+            return sheet, header_row, mapping
+
+    raise ValueError(
+        f"{path.name}: required timesheet columns not found in any worksheet/header row "
+        f"(scanned rows 1-{MAX_HEADER_ROW_SCAN + 1}). Worksheets: {sheets}. "
+        f"Headers found near the end of the scan: {last_headers}"
+    )
+
+
 def load_timesheet_file(path: Path, settings: Settings) -> tuple[pd.DataFrame, dict[str, str]]:
     """Read one timesheet file and rename its columns to canonical names.
 
     Returns the frame and the canonical-to-source column mapping that was used for this file.
     """
-    sheet = sheet_for(path, settings)
-    header_row = settings.header_overrides.get(path.stem, settings.header_row)
-    raw = read_workbook(path, sheet, header_row)
-    mapping = resolve_columns(raw.columns, path.name)
+    if path.suffix.lower() == ".xlsb":
+        with pd.ExcelFile(path, engine=_xlsb_engine()) as workbook:
+            sheet, header_row, mapping = _find_excel_layout(workbook, path, settings)
+            raw = workbook.parse(sheet_name=sheet, header=header_row)
+    else:
+        header_row, mapping = _find_csv_header(path, settings)
+        sheet = 0
+        raw = pd.read_csv(path, header=header_row)
     frame = raw.rename(columns={raw_name: canonical for canonical, raw_name in mapping.items()})
     frame[SOURCE_FILE_COLUMN] = path.name
     frame[SOURCE_SHEET_COLUMN] = str(sheet)
